@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_system.h"
+#include "bootloader_random.h"
 
 // Include FreeRTOS headers
 #include "freertos/FreeRTOS.h"
@@ -19,8 +20,30 @@
 #include "freertos/task.h"
 
 #define HAL_SECRET_INFO_SIZE (4096)
-uint8_t halSecret[HAL_SECRET_INFO_SIZE];
+
 const esp_partition_t *halSecretPartition;
+
+void halAssertFailed(const char *file, int line, const char *msg) {
+  printf("+ERR,ASSERT: %s:%d %s\n", file, line, msg);
+  printf("HALT\n");
+  while (1) {
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+
+
+#define HAL_ASSERT(cond) (!!(cond) ? (void)0 : halAssertFailed(__FILENAME__, __LINE__, #cond))
+
+// Ensure that the random number generator is ready
+// TODO: panic if RNG is broken
+void halEnsureRandomReady() {
+  bootloader_random_enable();
+}
+
+uint32_t halRandomU32() {
+  return esp_random();
+}
 
 void halInit() {
   uart_config_t uart_config = {
@@ -37,21 +60,11 @@ void halInit() {
   ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE,
                                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
                                UART_PIN_NO_CHANGE));
-
   // Open secret partition
   halSecretPartition = esp_partition_find_first(
       ESP_PARTITION_TYPE_ANY, ESP_PARTITION_TYPE_ANY, "secret_data");
-  if (halSecretPartition == NULL) {
-    printf("Secret partition not found\n");
-    return;
-  }
-  // Read secret partition
-  esp_err_t err = esp_partition_read(halSecretPartition, 0, halSecret,
-                                     HAL_SECRET_INFO_SIZE);
-  if (err != ESP_OK) {
-    printf("Failed to read secret partition\n");
-    return;
-  }
+  HAL_ASSERT(halSecretPartition != NULL);
+  halEnsureRandomReady();
 }
 
 int halRequestUserConsent() {
@@ -131,7 +144,19 @@ int halUartWriteHexBuf(const uint8_t *buffer, size_t length) {
   return 0;
 }
 
-int halProgramSecret() {
+int halReadSecretInfo(uint8_t* dst) {
+  if (halSecretPartition == NULL) {
+    return -1;
+  }
+  esp_err_t err = esp_partition_read(halSecretPartition, 0, dst,
+                                     HAL_SECRET_INFO_SIZE);
+  if (err != ESP_OK) {
+    return -1;
+  }
+  return 0;
+}
+
+int halProgramSecretInfo(const uint8_t* src){
   esp_err_t err = esp_partition_erase_range(halSecretPartition, 0,
                                             halSecretPartition->size);
   if (err != ESP_OK) {
@@ -139,7 +164,7 @@ int halProgramSecret() {
     return -1;
   }
   err =
-      esp_partition_write(halSecretPartition, 0, halSecret, sizeof(halSecret));
+      esp_partition_write(halSecretPartition, 0, src, HAL_SECRET_INFO_SIZE);
   if (err != ESP_OK) {
     printf("Failed to write secret partition");
     return -1;

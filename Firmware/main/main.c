@@ -1,22 +1,23 @@
 #include "ed25519.h"
 #include "hal.h"
 #include "sha2.h"
+#include "memzero.h"
 
 #define MAX_CMD_ARGS 8
 const char *cmdArgs[MAX_CMD_ARGS];
 char cmdBuf[4096];
-uint8_t dataBuf[1024];
+uint8_t dataBuf[2048];
 uint8_t pubKeyBuf[32];
-uint8_t secretKeyBuf[32];
 uint8_t signResultBuf[256];
 
-int isMasterSeedValid = 0;
+/* Secrets */
+uint8_t deviceSecretInfo[HAL_SECRET_INFO_SIZE];
+uint8_t userSecretSeedBuf[32];
+uint8_t secretKeyBuf[32];
+/* End of secrets */
 
-void genRandomBytes(void *p, size_t len) {
-  for (int i = 0; i < len; i++) {
-    ((uint8_t *)p)[i] = esp_random() & 0xFF;
-  }
-}
+int isUserSeedSet = 0;
+
 
 int decodeHexDigit(char ch) {
   if (ch >= '0' && ch <= '9') return ch - '0';
@@ -48,25 +49,33 @@ int tryDecodeHexBuf(const char *hex, uint8_t *dst, size_t dstLen) {
   return dstPos;
 }
 
-void clearKey() { memset(secretKeyBuf, 0, sizeof(secretKeyBuf)); }
+void clearSecretKey() { 
+  memzero(secretKeyBuf, sizeof(secretKeyBuf));
+}
 
 int deriveSecretKeyWithUsage(const char *usage) {
   SHA256_CTX ctx = {0};
-  clearKey();
+  clearSecretKey();
+  if (!isUserSeedSet) {
+    return -1;
+  }
   if (strlen(usage) < 5) {
     return -1;
   }
   sha256_Init(&ctx);
-  sha256_Update(&ctx, halSecret, HAL_SECRET_INFO_SIZE);
   sha256_Update(&ctx, (uint8_t *)usage, strlen(usage));
+  sha256_Update(&ctx, userSecretSeedBuf, sizeof(userSecretSeedBuf));
+  sha256_Update(&ctx, (uint8_t *)usage, strlen(usage));
+  const char* appendStr = "44KeyGenerateSecretKeyForUsage!";
+  sha256_Update(&ctx, (uint8_t *)appendStr, strlen(appendStr));
   sha256_Final(&ctx, secretKeyBuf);
   return 0;
 }
 
 // Prepare secret key for usage
 int cmdPrepareSecretKey(const char *usage, const char *ensureUsagePrefix) {
-  if (!isMasterSeedValid) {
-    halUartWriteStr("+ERR,key not generated\n");
+  if (!isUserSeedSet) {
+    halUartWriteStr("+ERR,user seed not set\r\n");
     return -1;
   }
   if (strlen(usage) < 5) {
@@ -90,7 +99,7 @@ void cmdPubKey() {
     return;
   }
   ed25519_publickey(secretKeyBuf, pubKeyBuf);
-  clearKey();
+  clearSecretKey();
   halUartWriteStr("+OK,");
   halUartWriteHexBuf(pubKeyBuf, sizeof(pubKeyBuf));
   halUartWriteStr("\n");
@@ -107,45 +116,76 @@ void cmdSign() {
     return;
   }
   ed25519_sign(dataBuf, dataLen, secretKeyBuf, pubKeyBuf, signResultBuf);
-  clearKey();
+  clearSecretKey();
   halUartWriteStr("+OK,");
   halUartWriteHexBuf(signResultBuf, sizeof(ed25519_signature));
   halUartWriteStr("\n");
 }
 
-void cmdGenKey() {
+void cmdFormat() {
+  if (isUserSeedSet) {
+    halUartWriteStr("+ERR,user seed already set\n");
+    return;
+  }
   int dataLen = tryDecodeHexBuf(cmdArgs[1], dataBuf, sizeof(dataBuf));
   if (dataLen != 32) {
     halUartWriteStr("+ERR,invalid data\n");
     return;
   }
-  memset(halSecret, 0, HAL_SECRET_INFO_SIZE);
-  // TODO: open wifi for random number generation
-  for (int i = 0; i < dataLen; i++) {
-    halSecret[i] = dataBuf[i];
+  
+  memzero(deviceSecretInfo, HAL_SECRET_INFO_SIZE);
+
+  for (int i = 0; i < 32; i++) {
+    deviceSecretInfo[i] = dataBuf[i];
   }
   for (int loop = 0; loop < 10; loop++) {
     for (int i = 0; i < HAL_SECRET_INFO_SIZE; i++) {
-      halSecret[i] ^= esp_random() & 0xFF;
+      deviceSecretInfo[i] ^= halRandomU32() & 0xFF;
     }
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
-  halSecret[HAL_SECRET_INFO_SIZE - 2] = 0x55;
-  halSecret[HAL_SECRET_INFO_SIZE - 1] = 0xAA;
+  deviceSecretInfo[HAL_SECRET_INFO_SIZE - 2] = 0x55;
+  deviceSecretInfo[HAL_SECRET_INFO_SIZE - 1] = 0xAA;
 
-  halProgramSecret();
+  HAL_ASSERT(halProgramSecretInfo(deviceSecretInfo) == 0);
   halUartWriteStr("+OK\n");
   // Reboot
   esp_restart();
 }
 
+void cmdUserSeed() {
+  if (isUserSeedSet) {
+    halUartWriteStr("+ERR,user seed already set\n");
+    return;
+  }
+  int dataLen = tryDecodeHexBuf(cmdArgs[1], dataBuf, sizeof(dataBuf));
+  if (dataLen != 32) {
+    halUartWriteStr("+ERR,invalid data\n");
+    return;
+  }
+  memzero(deviceSecretInfo, HAL_SECRET_INFO_SIZE);
+  HAL_ASSERT(halReadSecretInfo(deviceSecretInfo) == 0);
+  if (deviceSecretInfo[HAL_SECRET_INFO_SIZE - 2] != 0x55 || deviceSecretInfo[HAL_SECRET_INFO_SIZE - 1] != 0xAA) {
+    halUartWriteStr("+ERR,not formatted\n");
+    return;
+  }
+  SHA256_CTX ctx = {0};
+  sha256_Init(&ctx);
+  sha256_Update(&ctx, dataBuf, 32);
+  sha256_Update(&ctx, deviceSecretInfo, HAL_SECRET_INFO_SIZE);
+  memzero(deviceSecretInfo, HAL_SECRET_INFO_SIZE);
+  sha256_Update(&ctx, dataBuf, 32);
+  const char* appendStr = "44KeyGenerateUserSecretSeedByPassword!";
+  sha256_Update(&ctx, (uint8_t *)appendStr, strlen(appendStr));
+  sha256_Final(&ctx, userSecretSeedBuf);
+  isUserSeedSet = 1;
+  halUartWriteStr("+OK\n");
+}
+
 int app_main(void) {
   halInit();
   halUartClearInput();
-  if ((halSecret[HAL_SECRET_INFO_SIZE - 2] == 0x55) &&
-      (halSecret[HAL_SECRET_INFO_SIZE - 1] == 0xAA)) {
-    isMasterSeedValid = 1;
-  }
+
   while (1) {
     memset(cmdBuf, 0, sizeof(cmdBuf));
     for (int i = 0; i < MAX_CMD_ARGS; i++) {
@@ -170,12 +210,16 @@ int app_main(void) {
       }
       pos++;
     }
-    if (strcmp(cmdArgs[0], "+PUBKEY") == 0) {
+    if (strcmp(cmdArgs[0], "+PING") == 0) {
+      halUartWriteStr("+PONG\n");
+    } else if (strcmp(cmdArgs[0], "+USERSEED") == 0) {
+      cmdUserSeed();
+    } else if (strcmp(cmdArgs[0], "+PUBKEY") == 0) {
       cmdPubKey();
     } else if (strcmp(cmdArgs[0], "+SIGN") == 0) {
       cmdSign();
-    } else if (strcmp(cmdArgs[0], "+GENKEY") == 0) {
-      cmdGenKey();
+    } else if (strcmp(cmdArgs[0], "+FORMAT") == 0) {
+      cmdFormat();
     } else {
       halUartWriteStr("+ERR,unknown command\n");
     }
